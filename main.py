@@ -18,6 +18,13 @@ from io import BytesIO
 from telegram import Update, InputFile
 from telegram.constants import ParseMode, ChatAction
 from imdb import IMDb
+import os
+import tempfile
+import traceback
+import asyncio
+import yt_dlp
+from pathlib import Path
+from urllib.parse import urlparse
 
 # Mantener el bot activo en Render
 app = Flask('')
@@ -432,6 +439,292 @@ async def imdb_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         logger.error(f"Error en comando imdb: {e}")
         await processing_msg.edit_text(
             f"❌ Error al procesar la información de IMDb: {str(e)[:100]}"
+        )
+        
+@check_channel_membership
+async def down_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Descarga y envía contenido de Picta.cu al chat."""
+    if not update.message:
+        return
+    
+    # Verificar si el usuario proporcionó un enlace
+    if not context.args:
+        await update.message.reply_text(
+            "Por favor, proporciona un enlace de Picta.cu.\n"
+            "Ejemplo: /down https://www.picta.cu/movie/memoria-caracol-dyw8jwyqfc79fhvc"
+        )
+        return
+    
+    # Obtener el enlace
+    picta_url = context.args[0]
+    
+    # Verificar que es un enlace de Picta.cu válido
+    if not re.match(r'https?://(www\.)?picta\.cu/(movie|serie)/.+', picta_url):
+        await update.message.reply_text(
+            "❌ El enlace proporcionado no es un enlace válido de Picta.cu.\n"
+            "Debe ser un enlace a una película o serie en Picta."
+        )
+        return
+    
+    # Verificar el tipo de usuario para determinar límites y permisos
+    user_id = update.effective_user.id
+    user_data = db.get_user(user_id)
+    
+    # Verificar si el usuario tiene búsquedas disponibles
+    if not db.increment_daily_usage(user_id):
+        # Mostrar mensaje de límite alcanzado y opciones de planes
+        keyboard = []
+        for plan_id, plan in PLANS_INFO.items():
+            if plan_id != 'basic':
+                keyboard.append([
+                    InlineKeyboardButton(
+                        f"{plan['name']} - {plan['price']}",
+                        callback_data=f"buy_plan_{plan_id}"
+                    )
+                ])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(
+            "❌ Has alcanzado tu límite de búsquedas diarias.\n\n"
+            "Para continuar descargando, adquiere un plan premium:",
+            reply_markup=reply_markup
+        )
+        return
+    
+    # Enviar mensaje de procesamiento
+    status_message = await update.message.reply_text(
+        "🔍 Analizando el enlace de Picta... Por favor espera."
+    )
+    
+    # Mostrar acción "subiendo video" mientras se procesa
+    await context.bot.send_chat_action(
+        chat_id=update.effective_chat.id,
+        action=ChatAction.UPLOAD_VIDEO
+    )
+    
+    try:
+        # Obtener información del video usando yt-dlp
+        await status_message.edit_text("⏳ Obteniendo información del contenido...")
+        
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ydl_opts = {
+                'format': 'best',
+                'outtmpl': f'{temp_dir}/%(title)s.%(ext)s',
+                'quiet': True,
+                'no_warnings': True,
+                'ignoreerrors': False,
+                'noplaylist': True,
+            }
+            
+            video_info = None
+            video_path = None
+            
+            try:
+                # Extraer información del video
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    video_info = await asyncio.to_thread(ydl.extract_info, picta_url, download=False)
+                    
+                    if not video_info:
+                        await status_message.edit_text(
+                            "❌ No se pudo obtener información del contenido. Es posible que no esté disponible."
+                        )
+                        return
+                    
+                    # Actualizar mensaje con información del contenido
+                    title = video_info.get('title', 'Contenido de Picta')
+                    await status_message.edit_text(
+                        f"📥 Descargando: *{title}*\n\n"
+                        f"⏳ Iniciando descarga... Esto puede tomar varios minutos dependiendo del tamaño.",
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                    
+                    # Descargar el video
+                    await asyncio.to_thread(ydl.download, [picta_url])
+                    
+                    # Encontrar el archivo descargado
+                    files = list(Path(temp_dir).glob('*'))
+                    if not files:
+                        await status_message.edit_text(
+                            "❌ Error: No se pudo descargar el archivo."
+                        )
+                        return
+                    
+                    video_path = str(files[0])
+                    
+                    # Verificar el tamaño del archivo
+                    file_size = os.path.getsize(video_path) / (1024 * 1024)  # en MB
+                    
+                    # Informar sobre el progreso
+                    await status_message.edit_text(
+                        f"📥 Descargando: *{title}*\n\n"
+                        f"✅ Descarga completada: {file_size:.1f} MB\n\n"
+                        f"⏳ Enviando a Telegram... Por favor espera.",
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                    
+                    # Enviar el archivo al chat
+                    with open(video_path, 'rb') as video_file:
+                        # Determinar si es una película o serie
+                        is_movie = 'movie' in picta_url
+                        file_type = "Película" if is_movie else "Serie"
+                        
+                        # Enviar el video
+                        await context.bot.send_video(
+                            chat_id=update.effective_chat.id,
+                            video=video_file,
+                            caption=f"🎬 *{title}*\n\n"
+                                   f"📂 *Tipo:* {file_type}\n"
+                                   f"🔗 *Fuente:* Picta.cu\n",
+                            parse_mode=ParseMode.MARKDOWN,
+                            supports_streaming=True,
+                            width=video_info.get('width'),
+                            height=video_info.get('height'),
+                            duration=video_info.get('duration'),
+                        )
+                        
+                        # Eliminar mensaje de estado
+                        await status_message.delete()
+                    
+            except Exception as e:
+                logger.error(f"Error en la descarga con yt-dlp: {e}")
+                logger.error(traceback.format_exc())
+                
+                # Intentar método alternativo si yt-dlp falla
+                await status_message.edit_text(
+                    "⚠️ Error con el método principal. Intentando método alternativo..."
+                )
+                
+                try:
+                    # Intento alternativo usando requests y BeautifulSoup
+                    response = requests.get(picta_url, headers={'User-Agent': 'Mozilla/5.0'})
+                    response.raise_for_status()
+                    
+                    soup = BeautifulSoup(response.text, 'html.parser')
+                    
+                    # Buscar la URL del video
+                    video_src = None
+                    video_tags = soup.find_all('video')
+                    source_tags = soup.find_all('source')
+                    
+                    # Primero verificar las etiquetas <source>
+                    for source in source_tags:
+                        if 'src' in source.attrs:
+                            video_src = source['src']
+                            break
+                    
+                    # Si no, verificar las etiquetas <video>
+                    if not video_src:
+                        for video in video_tags:
+                            if 'src' in video.attrs:
+                                video_src = video['src']
+                                break
+                    
+                    # Si aún no hay URL, buscar en scripts
+                    if not video_src:
+                        scripts = soup.find_all('script')
+                        for script in scripts:
+                            script_text = script.string if script.string else ""
+                            # Buscar URLs de video en el JavaScript
+                            video_match = re.search(r'["\'](https?://.*?\.mp4)["\']', script_text)
+                            if video_match:
+                                video_src = video_match.group(1)
+                                break
+                    
+                    if not video_src:
+                        await status_message.edit_text(
+                            "❌ No se pudo encontrar el video en la página. El sitio puede haber cambiado su estructura."
+                        )
+                        return
+                    
+                    # Descargar el video
+                    await status_message.edit_text("📥 Descargando el video desde la URL encontrada...")
+                    
+                    # Determinar el nombre del archivo
+                    parsed_url = urlparse(video_src)
+                    file_name = os.path.basename(parsed_url.path)
+                    if not file_name or not file_name.endswith(('.mp4', '.mkv', '.avi', '.mov')):
+                        file_name = "video_picta.mp4"
+                    
+                    video_path = f"{temp_dir}/{file_name}"
+                    
+                    # Descargar con requests
+                    with requests.get(video_src, stream=True, headers={'User-Agent': 'Mozilla/5.0'}) as r:
+                        r.raise_for_status()
+                        total_size = int(r.headers.get('content-length', 0))
+                        total_size_mb = total_size / (1024 * 1024)
+                        
+                        # Actualizar mensaje con tamaño total
+                        await status_message.edit_text(
+                            f"📥 Descargando video...\n\n"
+                            f"💾 Tamaño total: {total_size_mb:.1f} MB"
+                        )
+                        
+                        # Descargar en chunks para archivos grandes
+                        downloaded = 0
+                        last_percent = 0
+                        with open(video_path, 'wb') as f:
+                            for chunk in r.iter_content(chunk_size=8192):
+                                if chunk:
+                                    f.write(chunk)
+                                    downloaded += len(chunk)
+                                    
+                                    # Actualizar progreso cada 10%
+                                    percent = int(downloaded * 100 / total_size)
+                                    if percent >= last_percent + 10:
+                                        last_percent = percent
+                                        await status_message.edit_text(
+                                            f"📥 Descargando video...\n\n"
+                                            f"💾 Tamaño total: {total_size_mb:.1f} MB\n"
+                                            f"⏳ Progreso: {percent}%"
+                                        )
+                    
+                    # Obtener título de la página
+                    title_tag = soup.find('title')
+                    title = title_tag.text if title_tag else "Contenido de Picta"
+                    title = title.replace(" - Picta", "").strip()
+                    
+                    # Informar finalización de descarga
+                    await status_message.edit_text(
+                        f"📥 Descargando: *{title}*\n\n"
+                        f"✅ Descarga completada: {total_size_mb:.1f} MB\n\n"
+                        f"⏳ Enviando a Telegram... Por favor espera.",
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                    
+                    # Determinar si es una película o serie
+                    is_movie = 'movie' in picta_url
+                    file_type = "Película" if is_movie else "Serie"
+                    
+                    # Enviar el video
+                    with open(video_path, 'rb') as video_file:
+                        await context.bot.send_video(
+                            chat_id=update.effective_chat.id,
+                            video=video_file,
+                            caption=f"🎬 *{title}*\n\n"
+                                   f"📂 *Tipo:* {file_type}\n"
+                                   f"🔗 *Fuente:* Picta.cu\n",
+                            parse_mode=ParseMode.MARKDOWN,
+                            supports_streaming=True
+                        )
+                        
+                        # Eliminar mensaje de estado
+                        await status_message.delete()
+                
+                except Exception as alt_e:
+                    logger.error(f"Error en método alternativo: {alt_e}")
+                    logger.error(traceback.format_exc())
+                    await status_message.edit_text(
+                        f"❌ No se pudo descargar el contenido: {str(alt_e)[:100]}\n\n"
+                        f"Por favor, verifica que el enlace sea correcto y que el contenido esté disponible."
+                    )
+    
+    except Exception as e:
+        logger.error(f"Error general en down_command: {e}")
+        logger.error(traceback.format_exc())
+        await status_message.edit_text(
+            f"❌ Error al procesar la descarga: {str(e)[:100]}\n\n"
+            f"Por favor, intenta más tarde o con otro enlace."
         )
 
 @check_channel_membership
@@ -2121,6 +2414,7 @@ def main() -> None:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("search", search_content))
     application.add_handler(CommandHandler("imdb", imdb_command))
+    application.add_handler(CommandHandler("down", down_command))
     application.add_handler(CommandHandler("plan", set_user_plan))
     application.add_handler(CommandHandler("addgift_code", add_gift_code))
     application.add_handler(CommandHandler("gift_code", redeem_gift_code))
