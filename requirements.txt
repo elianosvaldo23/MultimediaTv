@@ -4,3 +4,5 @@ beautifulsoup4>=4.11.2
 imdbpy>=2021.4.18
 flask>=2.2.3
 python-dotenv>=1.0.0
+yt-dlp>=2023.3.4
+ffmpeg-python>=0.2.0
