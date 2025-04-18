@@ -21,7 +21,6 @@ from imdb import IMDb
 import os
 import tempfile
 import traceback
-import asyncio
 import yt_dlp
 from pathlib import Path
 from urllib.parse import urlparse
@@ -41,7 +40,7 @@ def keep_alive():
     t.start()
 
 # Constantes del bot
-TOKEN = "7853962859:AAEsWR8uuqey8zh62XnFDlXmjDZzaNiO_YA"
+TOKEN = "7716154596:AAG1o_zmCJ2x7Mtxay-ddz98TcdVce9fdFs"
 ADMIN_ID = 1742433244
 CHANNEL_ID = -1002584219284
 GROUP_ID = -1002585538833
@@ -85,6 +84,11 @@ PLANS_INFO = {
         'features': ['Búsquedas ilimitadas', 'Pedidos ilimitados', 'Reenvío y guardado permitido', 'Enlaces directos de descarga', 'Soporte VIP', 'Duración: 30 días']
     }
 }
+
+# Constantes y variables globales para el sistema de series
+UPSER_STATE_IDLE = 0        # No hay carga de serie en proceso
+UPSER_STATE_RECEIVING = 1   # Recibiendo capítulos
+UPSER_STATE_COVER = 2       # Esperando la portada con descripción
 
 # Enable logging
 logging.basicConfig(
@@ -220,6 +224,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             logger.error(f"Error procesando content_id: {e}")
             # Continuar con el flujo normal de start si falla
     
+    # Comprobar si es una solicitud de serie
+    if context.args and context.args[0].startswith('series_'):
+        try:
+            series_id = int(context.args[0].replace('series_', ''))
+            await handle_series_request(update, context, series_id)
+            return
+        except (ValueError, IndexError) as e:
+            logger.error(f"Error procesando series_id: {e}")
+            # Continuar con el flujo normal de start si falla
+    
     # Check if this is a referral (código existente)
     if context.args and context.args[0].startswith('ref_'):
         ref_id = context.args[0].replace('ref_', '')
@@ -264,6 +278,261 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"las cuales puedes buscar o solicitar en caso de no estar en el catálogo",
         reply_markup=reply_markup
     )
+
+async def handle_series_request(update: Update, context: ContextTypes.DEFAULT_TYPE, series_id: int) -> None:
+    """Manejar la solicitud de visualización de una serie"""
+    user_id = update.effective_user.id
+    user_data = db.get_user(user_id)
+    
+    # Verificar límites de búsqueda
+    if not db.increment_daily_usage(user_id):
+        # Mostrar mensaje de límite excedido y opciones de planes
+        keyboard = []
+        for plan_id, plan in PLANS_INFO.items():
+            if plan_id != 'basic':
+                keyboard.append([
+                    InlineKeyboardButton(
+                        f"{plan['name']} - {plan['price']}",
+                        callback_data=f"buy_plan_{plan_id}"
+                    )
+                ])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(
+            "❌ Has alcanzado tu límite de búsquedas diarias.\n\n"
+            "Para continuar viendo series, adquiere un plan premium:",
+            reply_markup=reply_markup
+        )
+        return
+    
+    # Mostrar acción de escribiendo
+    await context.bot.send_chat_action(
+        chat_id=update.effective_chat.id,
+        action=ChatAction.TYPING
+    )
+    
+    # Obtener datos de la serie
+    series = db.get_series(series_id)
+    
+    if not series:
+        await update.message.reply_text(
+            "❌ Serie no encontrada. Es posible que haya sido eliminada o que el enlace sea incorrecto."
+        )
+        return
+    
+    # Obtener capítulos
+    episodes = db.get_series_episodes(series_id)
+    
+    if not episodes:
+        await update.message.reply_text(
+            "❌ Esta serie no tiene capítulos disponibles actualmente."
+        )
+        return
+    
+    # Obtener portada
+    cover_message_id = series['cover_message_id']
+    
+    try:
+        # Enviar portada
+        await context.bot.copy_message(
+            chat_id=update.effective_chat.id,
+            from_chat_id=SEARCH_CHANNEL_ID,
+            message_id=cover_message_id
+        )
+        
+        # Crear botones para los capítulos
+        keyboard = []
+        
+        # Añadir un botón para cada capítulo, organizados en filas de 3
+        for i in range(0, len(episodes), 3):
+            row = []
+            for j in range(i, min(i + 3, len(episodes))):
+                episode = episodes[j]
+                row.append(
+                    InlineKeyboardButton(
+                        f"Capítulo {episode['episode_number']}",
+                        callback_data=f"ep_{series_id}_{episode['episode_number']}"
+                    )
+                )
+            keyboard.append(row)
+        
+        # Añadir botón para enviar todos los capítulos
+        keyboard.append([
+            InlineKeyboardButton(
+                "Enviar todos los capítulos",
+                callback_data=f"ep_all_{series_id}"
+            )
+        ])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        # Enviar mensaje con botones
+        await update.message.reply_text(
+            f"📺 *{series['title']}*\n\n"
+            f"Selecciona un capítulo para ver o solicita todos los capítulos:",
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.MARKDOWN
+        )
+        
+    except Exception as e:
+        logger.error(f"Error enviando datos de serie: {e}")
+        await update.message.reply_text(
+            f"❌ Error al mostrar la serie: {str(e)[:100]}\n\n"
+            f"Por favor, intenta más tarde."
+        )
+
+async def send_episode(query, context, series_id, episode_number):
+    """Enviar un capítulo específico al usuario"""
+    user_id = query.from_user.id
+    user_data = db.get_user(user_id)
+    can_forward = user_data and user_data.get('can_forward', False)
+    
+    await query.answer("Procesando tu solicitud...")
+    
+    # Mostrar acción de escribiendo
+    await context.bot.send_chat_action(
+        chat_id=query.message.chat_id,
+        action=ChatAction.TYPING
+    )
+    
+    try:
+        # Obtener datos del capítulo
+        episode = db.get_episode(series_id, episode_number)
+        
+        if not episode:
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text=f"❌ Capítulo {episode_number} no encontrado."
+            )
+            return
+        
+        # Enviar el capítulo
+        await context.bot.copy_message(
+            chat_id=query.message.chat_id,
+            from_chat_id=SEARCH_CHANNEL_ID,
+            message_id=episode['message_id'],
+            protect_content=not can_forward  # Proteger según el plan
+        )
+        
+        # Marcar el botón como seleccionado
+        keyboard = query.message.reply_markup.inline_keyboard
+        new_keyboard = []
+        
+        for row in keyboard:
+            new_row = []
+            for button in row:
+                if button.callback_data == query.data:
+                    # Marcar este botón como seleccionado
+                    new_row.append(InlineKeyboardButton(
+                        f"✅ {button.text}",
+                        callback_data=button.callback_data
+                    ))
+                else:
+                    new_row.append(button)
+            new_keyboard.append(new_row)
+        
+        # Actualizar el mensaje con el nuevo teclado
+        await query.edit_message_reply_markup(
+            reply_markup=InlineKeyboardMarkup(new_keyboard)
+        )
+        
+    except Exception as e:
+        logger.error(f"Error enviando capítulo: {e}")
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=f"❌ Error al enviar el capítulo: {str(e)[:100]}"
+        )
+
+async def send_all_episodes(query, context, series_id):
+    """Enviar todos los capítulos de una serie al usuario"""
+    user_id = query.from_user.id
+    user_data = db.get_user(user_id)
+    can_forward = user_data and user_data.get('can_forward', False)
+    
+    await query.answer("Enviando todos los capítulos...")
+    
+    # Mostrar acción de escribiendo
+    await context.bot.send_chat_action(
+        chat_id=query.message.chat_id,
+        action=ChatAction.TYPING
+    )
+    
+    try:
+        # Obtener todos los capítulos
+        episodes = db.get_series_episodes(series_id)
+        
+        if not episodes:
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text="❌ No se encontraron capítulos para esta serie."
+            )
+            return
+        
+        # Enviar mensaje de inicio
+        status_message = await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=f"⏳ Enviando {len(episodes)} capítulos... Por favor, espera."
+        )
+        
+        # Enviar cada capítulo
+        for i, episode in enumerate(episodes):
+            try:
+                # Actualizar estado periódicamente
+                if i % 5 == 0 and i > 0:
+                    await status_message.edit_text(
+                        f"⏳ Enviando capítulos... ({i}/{len(episodes)})"
+                    )
+                
+                # Enviar capítulo
+                await context.bot.copy_message(
+                    chat_id=query.message.chat_id,
+                    from_chat_id=SEARCH_CHANNEL_ID,
+                    message_id=episode['message_id'],
+                    protect_content=not can_forward,  # Proteger según el plan
+                    disable_notification=(i < len(episodes) - 1)  # Solo notificar el último
+                )
+                
+                # Pequeña pausa para no sobrecargar
+                await asyncio.sleep(0.5)
+                
+            except Exception as e:
+                logger.error(f"Error enviando capítulo {i+1}: {e}")
+                continue
+        
+        # Actualizar mensaje de estado
+        await status_message.edit_text(
+            f"✅ Se han enviado todos los capítulos ({len(episodes)})."
+        )
+        
+        # Marcar el botón como seleccionado
+        keyboard = query.message.reply_markup.inline_keyboard
+        new_keyboard = []
+        
+        for row in keyboard:
+            new_row = []
+            for button in row:
+                if button.callback_data == query.data:
+                    # Marcar este botón como seleccionado
+                    new_row.append(InlineKeyboardButton(
+                        f"✅ {button.text}",
+                        callback_data=button.callback_data
+                    ))
+                else:
+                    new_row.append(button)
+            new_keyboard.append(new_row)
+        
+        # Actualizar el mensaje con el nuevo teclado
+        await query.edit_message_reply_markup(
+            reply_markup=InlineKeyboardMarkup(new_keyboard)
+        )
+        
+    except Exception as e:
+        logger.error(f"Error general enviando todos los capítulos: {e}")
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=f"❌ Error al enviar los capítulos: {str(e)[:100]}"
+        )
 
 @check_channel_membership
 async def imdb_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2195,6 +2464,241 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"❌ Fallidos: {failed_count}"
     )
     
+async def upser_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Comando para administradores para iniciar/finalizar la carga de series"""
+    user = update.effective_user
+    
+    # Verificar que el usuario es administrador
+    if user.id != ADMIN_ID:
+        return
+    
+    # Obtener el estado actual
+    upser_state = context.user_data.get('upser_state', UPSER_STATE_IDLE)
+    
+    # Si estamos en estado IDLE, iniciar el proceso
+    if upser_state == UPSER_STATE_IDLE:
+        # Inicializar o reiniciar la estructura de datos para la serie
+        context.user_data['upser_episodes'] = []
+        context.user_data['upser_state'] = UPSER_STATE_RECEIVING
+        context.user_data['upser_cover'] = None
+        context.user_data['upser_description'] = None
+        
+        await update.message.reply_text(
+            "📺 *Modo de carga de series activado*\n\n"
+            "1️⃣ Envía los capítulos en orden uno por uno\n"
+            "2️⃣ Luego envía una imagen con la descripción de la serie\n"
+            "3️⃣ Finalmente, envía /upser nuevamente para finalizar y subir la serie\n\n"
+            "Para cancelar el proceso, envía /cancelupser",
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    # Si estamos recibiendo capítulos y tenemos una portada, finalizamos
+    elif upser_state == UPSER_STATE_COVER and context.user_data.get('upser_cover'):
+        await finalize_series_upload(update, context)
+    
+    # Si estamos recibiendo capítulos pero no tenemos portada, indicar que falta
+    elif upser_state == UPSER_STATE_RECEIVING:
+        await update.message.reply_text(
+            "⚠️ Aún no has enviado la imagen con la descripción de la serie.\n\n"
+            "Por favor, envía primero la imagen antes de finalizar el proceso.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    # Cualquier otro estado (no debería ocurrir)
+    else:
+        await update.message.reply_text(
+            "❌ Error en el estado de carga de series. Reinicia el proceso con /upser."
+        )
+        context.user_data['upser_state'] = UPSER_STATE_IDLE
+
+async def cancel_upser_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Cancelar el proceso de carga de series"""
+    user = update.effective_user
+    
+    # Verificar que el usuario es administrador
+    if user.id != ADMIN_ID:
+        return
+    
+    # Reiniciar el estado
+    context.user_data['upser_state'] = UPSER_STATE_IDLE
+    context.user_data['upser_episodes'] = []
+    context.user_data['upser_cover'] = None
+    context.user_data['upser_description'] = None
+    
+    await update.message.reply_text(
+        "❌ Proceso de carga de series cancelado.\n\n"
+        "Todos los datos temporales han sido eliminados."
+    )
+
+async def handle_upser_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Manejar la recepción de capítulos y portada durante el proceso de carga de series"""
+    user = update.effective_user
+    
+    # Verificar que el usuario es administrador
+    if user.id != ADMIN_ID:
+        return
+    
+    # Verificar si estamos en modo de carga de series
+    upser_state = context.user_data.get('upser_state', UPSER_STATE_IDLE)
+    if upser_state == UPSER_STATE_IDLE:
+        return  # No estamos en modo de carga de series
+    
+    # Si recibimos un mensaje con foto y estamos en modo de recepción, es la portada
+    if update.message.photo and upser_state == UPSER_STATE_RECEIVING:
+        # Guardar la portada y descripción
+        context.user_data['upser_cover'] = update.message.photo[-1].file_id
+        context.user_data['upser_description'] = update.message.caption or "Sin descripción"
+        context.user_data['upser_state'] = UPSER_STATE_COVER
+        
+        await update.message.reply_text(
+            "✅ Portada recibida correctamente.\n\n"
+            "Ahora envía /upser nuevamente para finalizar y subir la serie.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    # Si estamos en modo de recepción y recibimos un video/documento, es un capítulo
+    if (update.message.video or update.message.document) and upser_state == UPSER_STATE_RECEIVING:
+        # Determinar el número de capítulo
+        episode_number = len(context.user_data.get('upser_episodes', [])) + 1
+        
+        # Guardar el capítulo
+        episode_data = {
+            'message_id': update.message.message_id,
+            'episode_number': episode_number,
+            'chat_id': update.effective_chat.id,
+        }
+        
+        context.user_data.setdefault('upser_episodes', []).append(episode_data)
+        
+        await update.message.reply_text(
+            f"✅ Capítulo {episode_number} recibido y guardado.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+async def finalize_series_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Finalizar el proceso de carga y subir la serie a los canales"""
+    episodes = context.user_data.get('upser_episodes', [])
+    cover_photo = context.user_data.get('upser_cover')
+    description = context.user_data.get('upser_description', "Sin descripción")
+    
+    # Verificar que tenemos todos los datos necesarios
+    if not episodes or not cover_photo:
+        await update.message.reply_text(
+            "❌ No hay suficientes datos para subir la serie.\n\n"
+            "Debes enviar al menos un capítulo y una imagen de portada."
+        )
+        return
+    
+    # Mensaje de estado para seguir el progreso
+    status_message = await update.message.reply_text(
+        "⏳ Procesando la serie y subiendo a los canales...",
+        parse_mode=ParseMode.MARKDOWN
+    )
+    
+    try:
+        # 1. Subir la portada con descripción al canal de búsqueda
+        sent_cover = await context.bot.send_photo(
+            chat_id=SEARCH_CHANNEL_ID,
+            photo=cover_photo,
+            caption=description
+        )
+        
+        search_channel_cover_id = sent_cover.message_id
+        
+        # 2. Subir todos los capítulos al canal de búsqueda (silenciosamente)
+        search_channel_episode_ids = []
+        
+        for episode in episodes:
+            # Obtener el mensaje original
+            original_message = await context.bot.copy_message(
+                chat_id=SEARCH_CHANNEL_ID,
+                from_chat_id=episode['chat_id'],
+                message_id=episode['message_id'],
+                disable_notification=True
+            )
+            
+            search_channel_episode_ids.append(original_message.message_id)
+        
+        # 3. Crear un identificador único para esta serie
+        series_id = int(time.time())
+        
+        # 4. Generar URL para el botón "Ver ahora"
+        view_url = f"https://t.me/MultimediaTVbot?start=series_{series_id}"
+        
+        # 5. Crear un botón para la portada
+        keyboard = [
+            [InlineKeyboardButton("Ver ahora", url=view_url)]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        # 6. Actualizar la portada en el canal de búsqueda con el botón
+        await context.bot.edit_message_reply_markup(
+            chat_id=SEARCH_CHANNEL_ID,
+            message_id=search_channel_cover_id,
+            reply_markup=reply_markup
+        )
+        
+        # 7. Repetir el proceso para el canal principal
+        sent_cover_main = await context.bot.send_photo(
+            chat_id=CHANNEL_ID,
+            photo=cover_photo,
+            caption=description
+        )
+        
+        # 8. Actualizar la portada en el canal principal con el mismo botón
+        await context.bot.edit_message_reply_markup(
+            chat_id=CHANNEL_ID,
+            message_id=sent_cover_main.message_id,
+            reply_markup=reply_markup
+        )
+        
+        # 9. Guardar los datos en la base de datos
+        # Extraer título de la descripción (primera línea o primeros 50 caracteres)
+        title = description.split('\n')[0] if '\n' in description else description[:50]
+        
+        # Guardar la serie en la base de datos
+        db.add_series(
+            series_id=series_id,
+            title=title,
+            description=description,
+            cover_message_id=search_channel_cover_id,
+            added_by=update.effective_user.id
+        )
+        
+        # Guardar los capítulos en la base de datos
+        for i, episode_id in enumerate(search_channel_episode_ids):
+            db.add_episode(
+                series_id=series_id,
+                episode_number=i + 1,
+                message_id=episode_id
+            )
+        
+        # 10. Reiniciar el estado
+        context.user_data['upser_state'] = UPSER_STATE_IDLE
+        context.user_data['upser_episodes'] = []
+        context.user_data['upser_cover'] = None
+        context.user_data['upser_description'] = None
+        
+        # 11. Informar al administrador
+        await status_message.edit_text(
+            f"✅ Serie subida correctamente a los canales.\n\n"
+            f"📊 Detalles:\n"
+            f"- Capítulos: {len(episodes)}\n"
+            f"- ID de serie: {series_id}\n"
+            f"- Canal de búsqueda: ✓\n"
+            f"- Canal principal: ✓\n\n"
+            f"Los usuarios pueden acceder a la serie con el botón 'Ver ahora'."
+        )
+        
+    except Exception as e:
+        logger.error(f"Error subiendo serie: {e}")
+        await status_message.edit_text(
+            f"❌ Error al subir la serie: {str(e)[:100]}\n\n"
+            f"Por favor, intenta nuevamente."
+        )
+
 async def verify_channel_membership(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Verifica la membresía del usuario cuando presiona el botón 'Ya me uní'."""
     query = update.callback_query
@@ -2253,6 +2757,35 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     if data == "verify_membership":
         await verify_channel_membership(update, context)
         return
+    
+    # Manejar solicitudes de capítulos individuales
+    if data.startswith("ep_") and not data.startswith("ep_all_"):
+        try:
+            # Formato: ep_[series_id]_[episode_number]
+            _, series_id, episode_number = data.split("_")
+            series_id = int(series_id)
+            episode_number = int(episode_number)
+            
+            await send_episode(query, context, series_id, episode_number)
+            return
+        except Exception as e:
+            logger.error(f"Error procesando solicitud de capítulo: {e}")
+            await query.answer(f"Error: {str(e)[:200]}")
+            return
+
+    # Manejar solicitudes de todos los capítulos
+    elif data.startswith("ep_all_"):
+        try:
+            # Formato: ep_all_[series_id]
+            _, series_id = data.split("_all_")
+            series_id = int(series_id)
+            
+            await send_all_episodes(query, context, series_id)
+            return
+        except Exception as e:
+            logger.error(f"Error procesando solicitud de todos los capítulos: {e}")
+            await query.answer(f"Error: {str(e)[:200]}")
+            return
     
     # Verificar membresía antes de procesar otros callbacks
     user_id = query.from_user.id
@@ -2416,6 +2949,8 @@ def main() -> None:
     application.add_handler(CommandHandler("imdb", imdb_command))
     application.add_handler(CommandHandler("down", down_command))
     application.add_handler(CommandHandler("plan", set_user_plan))
+    application.add_handler(CommandHandler("upser", upser_command))
+    application.add_handler(CommandHandler("cancelupser", cancel_upser_command))
     application.add_handler(CommandHandler("addgift_code", add_gift_code))
     application.add_handler(CommandHandler("gift_code", redeem_gift_code))
     application.add_handler(CommandHandler("ban", ban_user))
@@ -2433,6 +2968,12 @@ def main() -> None:
     
     # Add callback query handler
     application.add_handler(CallbackQueryHandler(handle_callback_query))
+    
+    application.add_handler(MessageHandler(
+    (filters.PHOTO | filters.VIDEO | filters.Document.ALL) & ~filters.COMMAND,
+    handle_upser_input,
+    # Este manejador debe ejecutarse después de otros manejadores más específicos
+), group=1)
     
     # Schedule periodic tasks - Solución alternativa
     # En lugar de run_daily, usamos run_repeating con un intervalo de 24h
