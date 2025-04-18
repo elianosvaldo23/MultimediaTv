@@ -81,6 +81,31 @@ class Database:
         )
         ''')
         
+        # Series table (NUEVA)
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS series (
+            series_id INTEGER PRIMARY KEY,
+            title TEXT,
+            description TEXT,
+            cover_message_id INTEGER,
+            added_by INTEGER,
+            added_at TEXT,
+            FOREIGN KEY (added_by) REFERENCES users (user_id)
+        )
+        ''')
+        
+        # Series episodes table (NUEVA)
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS series_episodes (
+            episode_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            series_id INTEGER,
+            episode_number INTEGER,
+            message_id INTEGER,
+            added_at TEXT,
+            FOREIGN KEY (series_id) REFERENCES series (series_id)
+        )
+        ''')
+        
         conn.commit()
         conn.close()
     
@@ -541,3 +566,203 @@ class Database:
         
         conn.close()
         return count
+    
+    # Nuevas funciones para manejar series
+    
+    def add_series(self, series_id, title, description, cover_message_id, added_by):
+        """Add a new series to the database"""
+        conn = sqlite3.connect(self.db_file)
+        cursor = conn.cursor()
+        
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        cursor.execute(
+            """INSERT INTO series 
+               (series_id, title, description, cover_message_id, added_by, added_at) 
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (series_id, title, description, cover_message_id, added_by, now)
+        )
+        
+        conn.commit()
+        conn.close()
+        
+        return series_id
+
+    def add_episode(self, series_id, episode_number, message_id):
+        """Add an episode to a series"""
+        conn = sqlite3.connect(self.db_file)
+        cursor = conn.cursor()
+        
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        cursor.execute(
+            """INSERT INTO series_episodes 
+               (series_id, episode_number, message_id, added_at) 
+               VALUES (?, ?, ?, ?)""",
+            (series_id, episode_number, message_id, now)
+        )
+        
+        episode_id = cursor.lastrowid
+        
+        conn.commit()
+        conn.close()
+        
+        return episode_id
+
+    def get_series(self, series_id):
+        """Get series data by ID"""
+        conn = sqlite3.connect(self.db_file)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT * FROM series WHERE series_id = ?", (series_id,))
+        series_data = cursor.fetchone()
+        
+        conn.close()
+        
+        if series_data:
+            return dict(series_data)
+        return None
+
+    def get_series_episodes(self, series_id):
+        """Get all episodes for a series, ordered by episode number"""
+        conn = sqlite3.connect(self.db_file)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        cursor.execute(
+            "SELECT * FROM series_episodes WHERE series_id = ? ORDER BY episode_number",
+            (series_id,)
+        )
+        episodes = [dict(row) for row in cursor.fetchall()]
+        
+        conn.close()
+        
+        return episodes
+
+    def get_episode(self, series_id, episode_number):
+        """Get a specific episode by series ID and episode number"""
+        conn = sqlite3.connect(self.db_file)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        cursor.execute(
+            "SELECT * FROM series_episodes WHERE series_id = ? AND episode_number = ?",
+            (series_id, episode_number)
+        )
+        episode = cursor.fetchone()
+        
+        conn.close()
+        
+        if episode:
+            return dict(episode)
+        return None
+
+    def get_all_series(self, limit=20, offset=0):
+        """Get a list of all series, with pagination"""
+        conn = sqlite3.connect(self.db_file)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        cursor.execute(
+            "SELECT * FROM series ORDER BY added_at DESC LIMIT ? OFFSET ?",
+            (limit, offset)
+        )
+        series_list = [dict(row) for row in cursor.fetchall()]
+        
+        conn.close()
+        
+        return series_list
+
+    def count_series_episodes(self, series_id):
+        """Count the number of episodes in a series"""
+        conn = sqlite3.connect(self.db_file)
+        cursor = conn.cursor()
+        
+        cursor.execute(
+            "SELECT COUNT(*) FROM series_episodes WHERE series_id = ?",
+            (series_id,)
+        )
+        count = cursor.fetchone()[0]
+        
+        conn.close()
+        
+        return count
+
+    def delete_series(self, series_id):
+        """Delete a series and all its episodes"""
+        conn = sqlite3.connect(self.db_file)
+        cursor = conn.cursor()
+        
+        # Delete episodes first (foreign key constraint)
+        cursor.execute("DELETE FROM series_episodes WHERE series_id = ?", (series_id,))
+        
+        # Delete the series
+        cursor.execute("DELETE FROM series WHERE series_id = ?", (series_id,))
+        
+        conn.commit()
+        conn.close()
+        
+    def search_series(self, query, limit=10):
+        """Search for series by title or description"""
+        conn = sqlite3.connect(self.db_file)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        # Usar LIKE para búsqueda sencilla
+        search_param = f"%{query}%"
+        
+        cursor.execute(
+            """SELECT * FROM series 
+               WHERE title LIKE ? OR description LIKE ? 
+               ORDER BY added_at DESC LIMIT ?""",
+            (search_param, search_param, limit)
+        )
+        
+        results = [dict(row) for row in cursor.fetchall()]
+        
+        conn.close()
+        
+        return results
+        
+    def get_latest_series(self, limit=5):
+        """Get the latest added series"""
+        conn = sqlite3.connect(self.db_file)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        cursor.execute(
+            "SELECT * FROM series ORDER BY added_at DESC LIMIT ?",
+            (limit,)
+        )
+        
+        latest = [dict(row) for row in cursor.fetchall()]
+        
+        conn.close()
+        
+        return latest
+        
+    def update_series_info(self, series_id, title=None, description=None):
+        """Update series title or description"""
+        conn = sqlite3.connect(self.db_file)
+        cursor = conn.cursor()
+        
+        # Solo actualizar campos proporcionados
+        if title and description:
+            cursor.execute(
+                "UPDATE series SET title = ?, description = ? WHERE series_id = ?",
+                (title, description, series_id)
+            )
+        elif title:
+            cursor.execute(
+                "UPDATE series SET title = ? WHERE series_id = ?",
+                (title, series_id)
+            )
+        elif description:
+            cursor.execute(
+                "UPDATE series SET description = ? WHERE series_id = ?",
+                (description, series_id)
+            )
+        
+        conn.commit()
+        conn.close()
