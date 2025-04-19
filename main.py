@@ -24,6 +24,7 @@ import traceback
 import yt_dlp
 from pathlib import Path
 from urllib.parse import urlparse
+from telegram.ext import PicklePersistence
 
 # Mantener el bot activo en Render
 app = Flask('')
@@ -533,6 +534,37 @@ async def send_all_episodes(query, context, series_id):
             chat_id=query.message.chat_id,
             text=f"❌ Error al enviar los capítulos: {str(e)[:100]}"
         )
+
+async def debug_database(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Comando para depurar la base de datos (solo admin)"""
+    user = update.effective_user
+    
+    # Verificar que el usuario es administrador
+    if user.id != ADMIN_ID:
+        return
+    
+    conn = sqlite3.connect(db.db_file)
+    cursor = conn.cursor()
+    
+    # Verificar tablas existentes
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+    tables = cursor.fetchall()
+    
+    # Contar registros en series y episodes
+    cursor.execute("SELECT COUNT(*) FROM series")
+    series_count = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM series_episodes")
+    episodes_count = cursor.fetchone()[0]
+    
+    conn.close()
+    
+    await update.message.reply_text(
+        f"📊 Información de la base de datos:\n\n"
+        f"Tablas: {[t[0] for t in tables]}\n"
+        f"Series registradas: {series_count}\n"
+        f"Capítulos registrados: {episodes_count}"
+    )
 
 @check_channel_membership
 async def imdb_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2658,22 +2690,33 @@ async def finalize_series_upload(update: Update, context: ContextTypes.DEFAULT_T
         # Extraer título de la descripción (primera línea o primeros 50 caracteres)
         title = description.split('\n')[0] if '\n' in description else description[:50]
         
-        # Guardar la serie en la base de datos
-        db.add_series(
-            series_id=series_id,
-            title=title,
-            description=description,
-            cover_message_id=search_channel_cover_id,
-            added_by=update.effective_user.id
-        )
-        
-        # Guardar los capítulos en la base de datos
-        for i, episode_id in enumerate(search_channel_episode_ids):
-            db.add_episode(
+        try:
+            # Guardar la serie en la base de datos
+            db.add_series(
                 series_id=series_id,
-                episode_number=i + 1,
-                message_id=episode_id
+                title=title,
+                description=description,
+                cover_message_id=search_channel_cover_id,
+                added_by=update.effective_user.id
             )
+            
+            # Guardar los capítulos en la base de datos
+            for i, episode_id in enumerate(search_channel_episode_ids):
+                db.add_episode(
+                    series_id=series_id,
+                    episode_number=i + 1,
+                    message_id=episode_id
+                )
+            
+            logger.info(f"Serie guardada correctamente en la base de datos: ID={series_id}, Título={title}, Episodios={len(search_channel_episode_ids)}")
+            
+        except Exception as db_error:
+            logger.error(f"Error guardando serie en la base de datos: {db_error}")
+            await status_message.edit_text(
+                f"⚠️ La serie se ha subido a los canales pero no se pudo guardar en la base de datos: {str(db_error)[:100]}\n\n"
+                f"Algunos botones podrían no funcionar correctamente."
+            )
+            return
         
         # 10. Reiniciar el estado
         context.user_data['upser_state'] = UPSER_STATE_IDLE
@@ -2932,11 +2975,27 @@ async def check_channel_memberships(context: ContextTypes.DEFAULT_TYPE):
         logger.info(f"Limpieza de caché de verificación: {len(expired_keys)} entradas eliminadas")
     except Exception as e:
         logger.error(f"Error en check_channel_memberships: {e}")
+        
+async def send_keepalive_message(context: ContextTypes.DEFAULT_TYPE):
+    """Send periodic message to keep the bot active."""
+    try:
+        await context.bot.send_message(
+            chat_id="-1002685140729",  # Your channel ID
+            text="🤖 Bot activo y funcionando correctamente."
+        )
+    except Exception as e:
+        logger.error(f"Error sending keepalive message: {e}")
+
+# Mantener el servidor Flask activo
+    keep_alive()
     
 def main() -> None:
     """Start the bot."""
     # Create the Application
-    application = Application.builder().token(TOKEN).build()
+    persistence = PicklePersistence(filepath="multimedia_tv_bot_data.pickle")
+    
+    # Create the Application with persistence
+    application = Application.builder().token(TOKEN).persistence(persistence).build()
     
     application.bot_data['verification_cache'] = {}
 
@@ -2959,12 +3018,20 @@ def main() -> None:
     application.add_handler(CommandHandler("admin_help", admin_help))
     application.add_handler(CommandHandler("stats", stats))
     application.add_handler(CommandHandler("broadcast", broadcast))
+    application.add_handler(CommandHandler("debugdb", debug_database))
     
     # Add message handler for direct text searches
     application.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND, 
         handle_search
     ))
+    
+    # Add periodic keepalive message (every 10 minutes = 600 seconds)
+    application.job_queue.run_repeating(
+        send_keepalive_message,
+        interval=600,
+        first=10  # Wait 10 seconds before first message
+    )
     
     # Add callback query handler
     application.add_handler(CallbackQueryHandler(handle_callback_query))
@@ -2998,8 +3065,5 @@ def main() -> None:
     # Start the Bot
     application.run_polling()
     
-    # Start Flask server to keep bot alive on Render
-    keep_alive()
-
 if __name__ == "__main__":
     main()
