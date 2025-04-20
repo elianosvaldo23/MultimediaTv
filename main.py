@@ -25,6 +25,18 @@ import yt_dlp
 from pathlib import Path
 from urllib.parse import urlparse
 from telegram.ext import PicklePersistence
+import signal
+import sys
+
+def handle_exit(signum, frame):
+    """Maneja señales de terminación sincronizando antes de salir"""
+    print(f"Recibida señal de terminación {signum}. Sincronizando base de datos...")
+    db.sync_with_dropbox(force=True)
+    sys.exit(0)
+
+# Registrar manejadores de señales
+signal.signal(signal.SIGINT, handle_exit)
+signal.signal(signal.SIGTERM, handle_exit)
 
 # Mantener el bot activo en Render
 app = Flask('')
@@ -279,6 +291,37 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"las cuales puedes buscar o solicitar en caso de no estar en el catálogo",
         reply_markup=reply_markup
     )
+    
+async def sync_dropbox(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Comando para forzar la sincronización con Dropbox (solo para administradores)"""
+    user = update.effective_user
+    
+    # Verificar que el usuario es administrador
+    if user.id != ADMIN_ID:
+        return
+    
+    try:
+        # Forzar sincronización
+        db.sync_with_dropbox(force=True)
+        
+        await update.message.reply_text(
+            "✅ Base de datos sincronizada correctamente con Dropbox."
+        )
+    except Exception as e:
+        logger.error(f"Error sincronizando con Dropbox: {e}")
+        
+        await update.message.reply_text(
+            f"❌ Error al sincronizar con Dropbox: {str(e)[:100]}"
+        )
+
+async def periodic_sync(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Tarea periódica para sincronizar con Dropbox"""
+    try:
+        db.sync_with_dropbox()
+        print(f"Sincronización periódica completada: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    except Exception as e:
+        print(f"Error en sincronización periódica: {e}")
+
 
 async def handle_series_request(update: Update, context: ContextTypes.DEFAULT_TYPE, series_id: int) -> None:
     """Manejar la solicitud de visualización de una serie"""
@@ -3048,6 +3091,13 @@ def main() -> None:
         check_plan_expiry,
         interval=24*60*60,  # 24 horas en segundos
         first=60            # Esperar 60 segundos antes de la primera ejecución
+    )
+    
+if hasattr(application, 'job_queue') and application.job_queue:
+    application.job_queue.run_repeating(
+        periodic_sync,
+        interval=5*60,  # Sincronizar cada 5 minutos
+        first=60        # Primera sincronización después de 1 minuto
     )
     
     application.job_queue.run_repeating(
