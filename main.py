@@ -3094,6 +3094,7 @@ def main() -> None:
     )
     
 if hasattr(application, 'job_queue') and application.job_queue:
+    
     application.job_queue.run_repeating(
         periodic_sync,
         interval=5*60,  # Sincronizar cada 5 minutos
