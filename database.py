@@ -1,16 +1,59 @@
 import sqlite3
 from datetime import datetime, timedelta
+import os
+import time
+import logging
+
+# Configurar logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Importar DropboxStorage
+try:
+    from dropbox_storage import DropboxStorage
+    DROPBOX_AVAILABLE = True
+except ImportError:
+    logger.warning("Módulo dropbox_storage no disponible. La sincronización con Dropbox no funcionará.")
+    DROPBOX_AVAILABLE = False
+
+# Token de Dropbox (truncado por seguridad)
+DROPBOX_TOKEN = "sl.u.AFoWxy3bhFExY5PnkBkrWdSNAdXgxkjG3bQP1wiXHRdE3EvUJdPD90jz5aaEXuhxVWoPM56HkIzqtpdQ-HA9RkpDZfQoAamJoI0PSbaFANn63qVSpiVJjFIu4019KhmpfE60IdTX1yOTHBSkzf2zb5YlUhb5LVQzftzV6Cmw57ZnH1XpYpCVfopQ40M8n8D"
 
 class Database:
     def __init__(self, db_file="multimedia_tv.db"):
         self.db_file = db_file
         self.admin_id = 1742433244
+        
+        # Inicializar almacenamiento en Dropbox si está disponible
+        self.dropbox_enabled = DROPBOX_AVAILABLE
+        if self.dropbox_enabled:
+            try:
+                self.storage = DropboxStorage(DROPBOX_TOKEN, self.db_file)
+                logger.info(f"Almacenamiento Dropbox inicializado para {self.db_file}")
+            except Exception as e:
+                logger.error(f"Error inicializando almacenamiento Dropbox: {e}")
+                self.dropbox_enabled = False
+        
+        # Crear tablas
         self.create_tables()
+    
+    def sync_with_dropbox(self, force=False):
+        """Sincroniza la base de datos con Dropbox"""
+        if not self.dropbox_enabled:
+            return
+        
+        try:
+            self.storage.upload(force=force)
+        except Exception as e:
+            logger.error(f"Error sincronizando con Dropbox: {e}")
     
     def create_tables(self):
         """Create necessary tables if they don't exist"""
         conn = sqlite3.connect(self.db_file)
         cursor = conn.cursor()
+        
+        # Habilitar WAL para mejor concurrencia y resistencia
+        cursor.execute("PRAGMA journal_mode=WAL;")
         
         # Users table
         cursor.execute('''
@@ -108,6 +151,9 @@ class Database:
         
         conn.commit()
         conn.close()
+        
+        # Sincronizar después de crear tablas
+        self.sync_with_dropbox(force=True)
     
     def add_user(self, user_id, username, first_name, last_name=None):
         """Add a new user to the database"""
@@ -123,6 +169,9 @@ class Database:
         
         conn.commit()
         conn.close()
+        
+        # Sincronizar con Dropbox
+        self.sync_with_dropbox()
     
     def get_user(self, user_id):
         """Get user data from the database"""
@@ -221,10 +270,14 @@ class Database:
         
         conn.commit()
         conn.close()
+        
+        # Sincronizar con Dropbox
+        self.sync_with_dropbox()
     
     def remove_plan(self, user_id):
         """Reset user to basic plan"""
         self.update_plan(user_id, 'basic', None)
+        # Sincronización ya realizada en update_plan
     
     def ban_user(self, user_id):
         """Ban a user"""
@@ -235,6 +288,9 @@ class Database:
         
         conn.commit()
         conn.close()
+        
+        # Sincronizar con Dropbox
+        self.sync_with_dropbox()
     
     def is_user_banned(self, user_id):
         """Check if a user is banned"""
@@ -307,6 +363,9 @@ class Database:
         conn.commit()
         conn.close()
         
+        # Sincronizar con Dropbox
+        self.sync_with_dropbox()
+        
         return True
     
     def update_request_count(self, user_id):
@@ -334,6 +393,9 @@ class Database:
         
         conn.commit()
         conn.close()
+        
+        # Sincronizar con Dropbox
+        self.sync_with_dropbox()
     
     def get_requests_left(self, user_id):
         """Get the number of requests a user has left today"""
@@ -365,6 +427,9 @@ class Database:
         
         conn.commit()
         conn.close()
+        
+        # Sincronizar con Dropbox
+        self.sync_with_dropbox()
     
     def get_gift_code(self, code):
         """Get gift code data if it exists and has uses left"""
@@ -390,6 +455,9 @@ class Database:
         
         conn.commit()
         conn.close()
+        
+        # Sincronizar con Dropbox
+        self.sync_with_dropbox()
     
     def reset_daily_limits(self):
         """Reset daily search and request limits for all users"""
@@ -400,6 +468,9 @@ class Database:
         
         conn.commit()
         conn.close()
+        
+        # Sincronizar con Dropbox
+        self.sync_with_dropbox(force=True)
     
     def get_expired_plans(self):
         """Get users with expired plans"""
@@ -544,6 +615,9 @@ class Database:
         
         conn.commit()
         conn.close()
+        
+        # Sincronizar con Dropbox
+        self.sync_with_dropbox()
     
     def is_referred(self, user_id):
         """Check if a user has already been referred"""
@@ -570,21 +644,56 @@ class Database:
     # Nuevas funciones para manejar series
     
     def add_series(self, series_id, title, description, cover_message_id, added_by):
-        """Add a new series to the database"""
+        """Add a new series to the database with additional safeguards"""
         conn = sqlite3.connect(self.db_file)
         cursor = conn.cursor()
         
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
-        cursor.execute(
-            """INSERT INTO series 
-               (series_id, title, description, cover_message_id, added_by, added_at) 
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (series_id, title, description, cover_message_id, added_by, now)
-        )
+        try:
+            # Verificar si ya existe una serie con este ID
+            cursor.execute("SELECT series_id FROM series WHERE series_id = ?", (series_id,))
+            existing = cursor.fetchone()
+            
+            if existing:
+                # Si existe, actualizar en lugar de insertar
+                cursor.execute(
+                    """UPDATE series 
+                       SET title = ?, description = ?, cover_message_id = ?, added_at = ? 
+                       WHERE series_id = ?""",
+                    (title, description, cover_message_id, now, series_id)
+                )
+                logger.info(f"Serie actualizada: ID={series_id}, Título={title}")
+            else:
+                # Si no existe, insertar
+                cursor.execute(
+                    """INSERT INTO series 
+                       (series_id, title, description, cover_message_id, added_by, added_at) 
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (series_id, title, description, cover_message_id, added_by, now)
+                )
+                logger.info(f"Nueva serie añadida: ID={series_id}, Título={title}")
+            
+            conn.commit()
+            
+            # Verificar que se guardó correctamente
+            cursor.execute("SELECT * FROM series WHERE series_id = ?", (series_id,))
+            result = cursor.fetchone()
+            
+            if not result:
+                logger.error(f"ERROR: La serie ID={series_id} no se pudo verificar después de guardar")
+            else:
+                logger.info(f"Serie verificada en DB: ID={series_id}, Columnas={len(result)}")
+                
+        except Exception as e:
+            logger.error(f"ERROR guardando serie: {e}")
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
         
-        conn.commit()
-        conn.close()
+        # Sincronizar con Dropbox
+        self.sync_with_dropbox(force=True)
         
         return series_id
 
@@ -606,6 +715,9 @@ class Database:
         
         conn.commit()
         conn.close()
+        
+        # Sincronizar con Dropbox
+        self.sync_with_dropbox()
         
         return episode_id
 
@@ -703,6 +815,9 @@ class Database:
         conn.commit()
         conn.close()
         
+        # Sincronizar con Dropbox
+        self.sync_with_dropbox()
+        
     def search_series(self, query, limit=10):
         """Search for series by title or description"""
         conn = sqlite3.connect(self.db_file)
@@ -766,3 +881,6 @@ class Database:
         
         conn.commit()
         conn.close()
+        
+        # Sincronizar con Dropbox
+        self.sync_with_dropbox()
