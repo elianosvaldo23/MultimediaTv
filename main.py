@@ -3062,6 +3062,7 @@ def main() -> None:
     application.add_handler(CommandHandler("stats", stats))
     application.add_handler(CommandHandler("broadcast", broadcast))
     application.add_handler(CommandHandler("debugdb", debug_database))
+    application.add_handler(CommandHandler("syncdb", sync_dropbox))
     
     # Add message handler for direct text searches
     application.add_handler(MessageHandler(
@@ -3092,9 +3093,7 @@ def main() -> None:
         interval=24*60*60,  # 24 horas en segundos
         first=60            # Esperar 60 segundos antes de la primera ejecución
     )
-    
-if hasattr(application, 'job_queue') and application.job_queue:
-    
+        
     application.job_queue.run_repeating(
         periodic_sync,
         interval=5*60,  # Sincronizar cada 5 minutos
