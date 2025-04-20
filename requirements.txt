@@ -6,3 +6,4 @@ flask>=2.2.3
 python-dotenv>=1.0.0
 yt-dlp>=2023.3.4
 ffmpeg-python>=0.2.0
+dropbox>=11.0.0
