@@ -1,7 +1,7 @@
 python-telegram-bot[job-queue]==20.7
 requests==2.31.0
 beautifulsoup4==4.12.2
-imdbpy==2023.5.1
+imdbpy==2022.7.9
 flask==2.3.3
 python-dotenv==1.0.0
 yt-dlp==2023.12.30
